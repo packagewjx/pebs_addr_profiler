@@ -37,7 +37,7 @@ static int pebs_address_profiler(struct kprobe *kp, struct pt_regs *regs)
          pebs < (void *)ds->pebs_index;
          pebs = pebs + pebs_record_size) {
         struct pebs_addr *v = pebs;
-        trace_pebs_addr(v->dla);
+        trace_pebs_addr(current->pid, v->dla);
     }
     return 0;
 }

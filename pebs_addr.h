@@ -7,15 +7,18 @@
 #include <linux/tracepoint.h>
 
 TRACE_EVENT(pebs_addr,
-        TP_PROTO(u64 dla),
-        TP_ARGS(dla),
+        TP_PROTO(pid_t tid, u64 dla),
+        TP_ARGS(tid, dla),
         TP_STRUCT__entry(
+            __field(pid_t, tid)
             __field(u64, dla)
         ),
         TP_fast_assign(
+            __entry->tid = tid;
             __entry->dla = dla;
         ),
-        TP_printk("%llx",
+        TP_printk("Thread %d: %llx",
+            __entry->tid,
             __entry->dla)
         );
 

@@ -7,7 +7,12 @@
 #include <asm/msr.h>
 #include <asm/processor.h>
 #include <asm/cpufeature.h>
+#include <linux/perf_event.h>
+#include <linux/hw_breakpoint.h>
+//#include </home/wjx/linux-5.4.0/arch/x86/events/perf_event.h>
+
 #define CREATE_TRACE_POINTS
+
 #include "pebs_addr.h"
 
 struct pebs_addr {
@@ -16,11 +21,144 @@ struct pebs_addr {
     u64 __unused2[5];
 };
 
+struct cpu_hw_events;
+
+// copy of <arch/x86/events/perf_event.h>, kernel version 5.4.0
+struct x86_pmu {
+    /*
+     * Generic x86 PMC bits
+     */
+    const char *name;
+    int version;
+
+    int (*handle_irq)(struct pt_regs *);
+
+    void (*disable_all)(void);
+
+    void (*enable_all)(int added);
+
+    void (*enable)(struct perf_event *);
+
+    void (*disable)(struct perf_event *);
+
+    void (*add)(struct perf_event *);
+
+    void (*del)(struct perf_event *);
+
+    void (*read)(struct perf_event *event);
+
+    int (*hw_config)(struct perf_event *event);
+
+    int (*schedule_events)(struct cpu_hw_events *cpuc, int n, int *assign);
+
+    unsigned eventsel;
+    unsigned perfctr;
+
+    int (*addr_offset)(int index, bool eventsel);
+
+    int (*rdpmc_index)(int index);
+
+    u64 (*event_map)(int);
+
+    int max_events;
+    int num_counters;
+    int num_counters_fixed;
+    int cntval_bits;
+    u64 cntval_mask;
+    union {
+        unsigned long events_maskl;
+        unsigned long events_mask[BITS_TO_LONGS(ARCH_PERFMON_EVENTS_COUNT)];
+    };
+    int events_mask_len;
+    int apic;
+    u64 max_period;
+
+    struct event_constraint *
+    (*get_event_constraints)(struct cpu_hw_events *cpuc,
+                             int idx,
+                             struct perf_event *event);
+
+    void (*put_event_constraints)(struct cpu_hw_events *cpuc,
+                                  struct perf_event *event);
+
+    void (*start_scheduling)(struct cpu_hw_events *cpuc);
+
+    void (*commit_scheduling)(struct cpu_hw_events *cpuc, int idx, int cntr);
+
+    void (*stop_scheduling)(struct cpu_hw_events *cpuc);
+
+    struct event_constraint *event_constraints;
+    struct x86_pmu_quirk *quirks;
+    int perfctr_second_write;
+
+    u64 (*limit_period)(struct perf_event *event, u64 l);
+
+    /* PMI handler bits */
+    unsigned int late_ack: 1,
+            counter_freezing: 1;
+    /*
+     * sysfs attrs
+     */
+    int attr_rdpmc_broken;
+    int attr_rdpmc;
+    struct attribute **format_attrs;
+
+    ssize_t (*events_sysfs_show)(char *page, u64 config);
+
+    const struct attribute_group **attr_update;
+
+    unsigned long attr_freeze_on_smi;
+
+    /*
+     * CPU Hotplug hooks
+     */
+    int (*cpu_prepare)(int cpu);
+
+    void (*cpu_starting)(int cpu);
+
+    void (*cpu_dying)(int cpu);
+
+    void (*cpu_dead)(int cpu);
+
+    void (*check_microcode)(void);
+
+    void (*sched_task)(struct perf_event_context *ctx,
+                       bool sched_in);
+
+    /*
+     * Intel Arch Perfmon v2+
+     */
+    u64 intel_ctrl;
+//    union perf_capabilities intel_cap;
+    u64 intel_cap;
+
+    /*
+     * Intel DebugStore bits
+     */
+    unsigned int bts: 1,
+            bts_active: 1,
+            pebs: 1,
+            pebs_active: 1,
+            pebs_broken: 1,
+            pebs_prec_dist: 1,
+            pebs_no_tlb: 1,
+            pebs_no_isolation: 1;
+    int pebs_record_size;
+    int pebs_buffer_size;
+    int max_pebs_events;
+
+    void (*drain_pebs)(struct pt_regs *regs);
+};
+
 static unsigned pebs_record_size = sizeof(struct pebs_addr);
 
 static DEFINE_PER_CPU(struct debug_store *, ds_base);
 
-static int pebs_address_profiler(struct kprobe *kp, struct pt_regs *regs)
+static struct x86_pmu* pmu;
+
+static void (*original_pebs_drain)(struct pt_regs *iregs);
+
+static void pebs_address_profiler(struct pt_regs *regs)
 {
     struct debug_store *ds;
     void *pebs;
@@ -29,7 +167,7 @@ static int pebs_address_profiler(struct kprobe *kp, struct pt_regs *regs)
     if (!ds) {
         u64 dsval;
         rdmsrl(MSR_IA32_DS_AREA, dsval);
-        ds = (struct debug_store *)dsval;
+        ds = (struct debug_store *) dsval;
         this_cpu_write(ds_base, ds);
     }
 
@@ -39,17 +177,10 @@ static int pebs_address_profiler(struct kprobe *kp, struct pt_regs *regs)
         struct pebs_addr *v = pebs;
         trace_pebs_addr(current->pid, v->dla);
     }
-    return 0;
 }
-
-static struct kprobe pebs_kp = {
-        .symbol_name = "intel_pmu_drain_pebs_nhm",
-        .pre_handler = pebs_address_profiler
-};
 
 static int init_pebs_addr_profiler(void)
 {
-    int err;
     u64 eax, cap;
     unsigned int pebs_version;
 
@@ -74,16 +205,16 @@ static int init_pebs_addr_profiler(void)
         return -EIO;
     }
 
-    if ((err = register_kprobe(&pebs_kp)) < 0) {
-        pr_err("Cannot register kprobe: %d\n", err);
-        return err;
-    }
+    pmu = (struct x86_pmu*) kallsyms_lookup_name("x86_pmu");
+    original_pebs_drain = pmu->drain_pebs;
+    pmu->drain_pebs = pebs_address_profiler;
+
     return 0;
 }
 
 static void exit_pebs_addr_profiler(void)
 {
-    unregister_kprobe(&pebs_kp);
+    pmu->drain_pebs = original_pebs_drain;
 }
 
 module_init(init_pebs_addr_profiler);
